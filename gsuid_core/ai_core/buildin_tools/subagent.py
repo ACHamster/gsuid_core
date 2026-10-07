@@ -8,8 +8,9 @@
 - ``create_subagent(task=...)``（空 agent_profile）：模型路径拒绝，须填花名册
   node_id。内核 ``summarize_long_input``（无 ctx）仍走通用 Plan-and-Solve。
 - ``create_subagent(task=..., agent_profile=...)``（默认 transient=False）：
-  **自动转为创建一棵单子任务的 Kanban 叶子根树**——同步等待该子任务跑完，把
-  代理返回值 + artifact 句柄拼成回执串返回给主人格。这条路径之所以走 Kanban：
+  **自动转为创建一棵单子任务的 Kanban 叶子根树**。生产路径派完即走，结论由
+  ``_wake_main_agent_for_delivery`` 回灌主人格。只有 ``create_by=="TEST"``
+  会同步等到子任务终态，再把代理返回值 + artifact 句柄拼成回执。这条路径之所以走 Kanban：
     * 产物（PNG / 文件 / 报告）有 Kanban root_task_id 锚点，看板树视图能直接
       看到；点开任务即可在详情里看全部 artifact + workspace 文件。
     * 主人格事后用 `artifact_get_recent` 能自然找回该次执行的最近产物。
@@ -24,7 +25,7 @@
 
 import re
 import asyncio
-from typing import Optional
+from typing import Callable, Optional
 
 from pydantic_ai import RunContext
 
@@ -197,8 +198,38 @@ def _get_subagent_semaphore() -> asyncio.Semaphore:
 
 
 # create_subagent(agent_profile=...) 转 Kanban：生产立刻 deferred 回灌，不占会话锁。
-# TEST/评测仍同步等待，因评测 HTTP 等不到回灌。
+# create_by 为 TEST 时同步等待，因为该入口等不到回灌。
 _KANBAN_TEST_WAIT_TIMEOUT_SEC = 90.0
+
+
+def _kanban_wait_sec(parent_create_by: str) -> float:
+    """生产派完即走，由执行体回灌；create_by 为 TEST 时同步等到终态。"""
+    if parent_create_by == "TEST":
+        return _KANBAN_TEST_WAIT_TIMEOUT_SEC
+    return 0.0
+
+
+def _inline_claim_verdict(claimed: bool, ordinal: int) -> Optional[str]:
+    """抢到投递权返回 None；没抢到就静默，避免和执行体各交一次。"""
+    if claimed:
+        return None
+    return f"✅ 任务#{ordinal} 刚好完成，但交付已被框架接手。请只输出 <SILENCE>，勿向用户说话、勿重复 create_subagent。"
+
+
+class _InlineClaimGate:
+    """同一次等待只认领一次。已经认领成功后，不得再因第二次失败改口静默。"""
+
+    def __init__(self) -> None:
+        self.claimed = False
+
+    def take(self, claim: Callable[[], bool], ordinal: int) -> Optional[str]:
+        if self.claimed:
+            return None
+        verdict = _inline_claim_verdict(claim(), ordinal)
+        if verdict is None:
+            self.claimed = True
+        return verdict
+
 
 # 纯 lookup 默认同步 ad-hoc（transient），不建看板卡。
 # 外部检索默认 Kanban：超时可回灌，取消不会把事实包扔掉。
@@ -383,13 +414,21 @@ async def _create_subagent_impl(
             return blocked
         _extra = ctx.deps.extra
         _wake = _extra["delivery_wake"] if "delivery_wake" in _extra else False
-        if _wake is True and pid != "render_agent":
-            if persona_allows_capability_agent(_pn, "render_agent"):
-                return (
-                    '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
-                    "或 send_message_by_ai 发送已有的图。不要新开查询。"
-                )
-            return "⚠️ 本轮是任务交付回灌。当前人格未启用出图代理，请直接用已有事实作答，不要新开查询。"
+        if _wake is True:
+            from gsuid_core.ai_core.planning.kanban_executor import delivery_wake_blocks_new_delegate
+
+            _ev = ctx.deps.ev
+            _sid = str(_ev.session_id) if _ev is not None and _ev.session_id else ""
+            _has_img = _extra["delivery_has_image"] is True if "delivery_has_image" in _extra else False
+            if _has_img or delivery_wake_blocks_new_delegate(_sid):
+                return "⚠️ 本帧只许 send_message_by_ai 发给发起人，禁止再委派。"
+            if pid != "render_agent":
+                if persona_allows_capability_agent(_pn, "render_agent"):
+                    return (
+                        '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
+                        "或 send_message_by_ai 发送已有的图。不要新开查询。"
+                    )
+                return "⚠️ 本轮是任务交付回灌。当前人格未启用出图代理，请直接用已有事实作答，不要新开查询。"
         _follow = _extra["turn_followup"] is True if "turn_followup" in _extra else False
         if pid != "render_agent" and not _follow and ctx.deps.ev is not None:
             _ground = turn_ground_source(ctx.deps.ev)
@@ -785,16 +824,8 @@ async def _dispatch_via_kanban(
     agent_profile: str,
 ) -> str:
     """把 create_subagent(agent_profile=...) 转为创建 Kanban **单任务**（叶子根）
-    并启动执行。生产路径立刻 deferred 回灌，不占主会话锁；TEST 仍同步等待。
-
-    每条主人格通过画像派出的任务都走这条路：
-    1. ``kanban.create_kanban_tree(root_agent_profile=pid)`` 建一棵**只有根任务**
-       的叶子树——根任务自身带 ``agent_profile``，被调度器当作单一可执行节点直接
-       派出。**不再**创建冗余的"根 + 1 子任务"双节点结构；
-    2. ``kick_root`` 立刻派活；
-    3. 生产：``mark_deferred_main_delivery`` 后立即返回，完成后
-       ``_wake_main_agent_for_delivery``；TEST 同步等到终态。
-    4. 抓根任务最新产出 artifact 句柄 + relay 文本，拼成回执给主人格。
+    并启动执行。生产路径登记 deferred 后立刻返回：主 session 放锁，别人可以继续
+    说话/再委派；结论只走 ``_wake_main_agent_for_delivery``。TEST 仍同步等到终态。
     """
     ev = ctx.deps.ev
     if ev is None:
@@ -803,12 +834,20 @@ async def _dispatch_via_kanban(
     from gsuid_core.ai_core.agent_node import get_node, resolve_node
 
     pid = resolve_node(agent_profile)
-    _wake = ctx.deps.extra["delivery_wake"] if "delivery_wake" in ctx.deps.extra else False
-    if _wake is True and pid != "render_agent":
-        return (
-            '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
-            "或 send_message_by_ai 发送已有的图。不要新开查询。"
-        )
+    _extra = ctx.deps.extra
+    _wake = _extra["delivery_wake"] if "delivery_wake" in _extra else False
+    if _wake is True:
+        from gsuid_core.ai_core.planning.kanban_executor import delivery_wake_blocks_new_delegate
+
+        sid = str(ev.session_id) if ev.session_id else ""
+        _has_img = _extra["delivery_has_image"] is True if "delivery_has_image" in _extra else False
+        if _has_img or delivery_wake_blocks_new_delegate(sid):
+            return "⚠️ 本帧只许 send_message_by_ai 发给发起人，禁止再委派。"
+        if pid != "render_agent":
+            return (
+                '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
+                "或 send_message_by_ai 发送已有的图。不要新开查询。"
+            )
     profile = get_node(pid)
     if profile is None:
         from gsuid_core.ai_core.agent_node import list_nodes
@@ -897,13 +936,21 @@ async def _dispatch_via_kanban(
     asyncio.create_task(kick_root(root.id))
 
     extra = ctx.deps.extra if ctx.deps is not None else {}
-    parent_cb = extra["parent_create_by"] if "parent_create_by" in extra else ""
-    wait_sec = _KANBAN_TEST_WAIT_TIMEOUT_SEC if parent_cb == "TEST" else 0.0
+    _raw_cb = extra["parent_create_by"] if "parent_create_by" in extra else ""
+    parent_cb = _raw_cb if isinstance(_raw_cb, str) else ""
+    wait_sec = _kanban_wait_sec(parent_cb)
     handle = delegation_handle(root.id)
+    if wait_sec <= 0:
+        from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+            format_deferred_subagent_ack,
+        )
+
+        return format_deferred_subagent_ack(ordinal=root.ordinal, pid=pid, handle=handle)
     deleg = await await_delegation(handle, wait_sec=wait_sec)
     if deleg is None:
         return f"⚠️ Kanban 任务记录消失（task_id={root.id}）；可能被并发删除，请到 webconsole 看任务列表。"
     final: Optional[AIAgentTask] = await AIAgentTask.get_by_id(root.id) if deleg.is_terminal else None
+    claim_gate = _InlineClaimGate()
 
     if final is None:
         fresh_after = await AIAgentTask.get_by_id(root.id)
@@ -913,19 +960,22 @@ async def _dispatch_via_kanban(
             "cancelled",
             "waiting_approval",
         ):
-            if try_claim_deferred_for_inline_return(root.id):
-                final = fresh_after
-            else:
-                return (
-                    f"✅ 任务#{root.ordinal} 刚好完成，框架正在回灌产物。"
-                    "请只输出 <SILENCE>，勿向用户说话、勿重复 create_subagent。"
-                )
+            verdict = claim_gate.take(lambda: try_claim_deferred_for_inline_return(root.id), root.ordinal)
+            if verdict is not None:
+                return verdict
+            final = fresh_after
         else:
             from gsuid_core.ai_core.capability_agents.delegation_contracts import (
                 format_deferred_subagent_ack,
             )
 
             return format_deferred_subagent_ack(ordinal=root.ordinal, pid=pid, handle=handle)
+
+    # 终态与超时边界都要认领；已经认领过就不要再调，否则第二次失败会把全文丢掉。
+    # 留下 interactive：执行体见到「interactive 在、deferred 不在」就不再唤醒。
+    verdict = claim_gate.take(lambda: try_claim_deferred_for_inline_return(root.id), root.ordinal)
+    if verdict is not None:
+        return verdict
 
     # 抓 artifact（最新一份用作产物展示）
     arts = await AIAgentArtifact.list_for_task(final.id)

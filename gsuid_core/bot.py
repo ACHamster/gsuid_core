@@ -1,7 +1,7 @@
 import time
 import asyncio
 import inspect
-from typing import Any, Dict, List, Union, Literal, Mapping, Optional
+from typing import Any, Dict, List, Union, Literal, Mapping, Optional, Coroutine
 
 from fastapi import WebSocket
 from msgspec import json as msgjson
@@ -120,7 +120,8 @@ class _Bot:
         self.sem = asyncio.Semaphore(command_semaphore)
         self._shutdown_event: Optional[asyncio.Event] = None
         # 独立发送队列：所有 WebSocket 发送操作通过此队列串行化执行
-        self._send_queue: asyncio.queues.Queue = asyncio.queues.Queue()
+        # 元素恒为待发送协程，标注类型实参以便 clear_send_queue 直接 close()（见 AGENTS.md §1.4）
+        self._send_queue: asyncio.queues.Queue[Coroutine[Any, Any, None]] = asyncio.queues.Queue()
         self._send_task: Optional[asyncio.Task] = None
         # 记录断连时间，用于重连时判断是否复用旧实例（避免内存泄漏）
         self._disconnected_at: Optional[float] = None
@@ -177,18 +178,28 @@ class _Bot:
             except Exception as e:
                 logger.exception(t("log.bot.send_worker_fail", error=e))
 
-    def clear_send_queue(self) -> None:
-        """清空发送队列中所有待发送的任务。
+    def clear_send_queue(self) -> int:
+        """清空发送队列中所有待发送的任务，返回丢弃的条数。
 
-        在 WebSocket 断连或重连前调用，防止旧连接积压的协程
-        被新连接的 worker 取出执行（闭包中捕获的是旧 ws 对象）。
+        在实例确实超时被丢弃时调用，防止旧连接积压的协程被新连接的 worker
+        取出执行（闭包中捕获的是旧 ws 对象）。
+
+        被丢弃的协程必须显式 ``close()``：它们从未被 await，直接扔掉会让
+        CPython 抛 ``RuntimeWarning: coroutine ... was never awaited``，
+        并在真正丢消息时不留任何可查痕迹。
         """
+        dropped = 0
         while not self._send_queue.empty():
             try:
-                self._send_queue.get_nowait()
+                coro = self._send_queue.get_nowait()
                 self._send_queue.task_done()
+                coro.close()
+                dropped += 1
             except asyncio.QueueEmpty:
                 break
+        if dropped:
+            logger.debug(t("log.bot.send_queue_cleared", count=dropped))
+        return dropped
 
     def resolve_recall(self, msg: MessageReceive) -> bool:
         """若 msg 是 recall_message_id 回执则消费它并唤醒对应 future。
@@ -227,7 +238,7 @@ class _Bot:
             self._send_task = asyncio.create_task(self._send_worker())
             logger.debug(t("log.bot.send_worker_started", bot_id=self.bot_id))
 
-    async def _enqueue_send(self, coro):
+    async def _enqueue_send(self, coro: Coroutine[Any, Any, None]) -> None:
         """将发送任务加入发送队列。
 
         Args:
@@ -248,7 +259,7 @@ class _Bot:
         group_id: Optional[str] = None,
         task_id: str = "",
         task_event: Optional[asyncio.Event] = None,
-        extra_metadata: Optional[Dict[str, Any]] = None,
+        extra_metadata: Optional[Mapping[str, object]] = None,
         wait_recall: bool = False,
     ) -> Optional[List[str]]:
         try:
@@ -742,7 +753,6 @@ class Bot:
 
         self.bot = bot
         self.ev = ev
-        self.logger = self.bot.logger
         self.bot_id = ev.bot_id
         self.bot_self_id = ev.bot_self_id
         self.resp: List[Event] = []
@@ -751,6 +761,11 @@ class Bot:
         self.mutiply_resp: List[Event] = []
         # 当前用户语言缓存（懒解析，一次事件内复用），见 get_lang()
         self._lang: Optional[str] = None
+
+    @property
+    def logger(self) -> GsLogger:
+        # 重连会新建 GsLogger。每次读取 _Bot.logger，避免留着旧对象。
+        return self.bot.logger
 
     def reset_text_stream(self) -> None:
         """出站流式：新模型请求前清对齐缓冲。默认无缓冲。"""
@@ -1020,7 +1035,7 @@ class Bot:
         self,
         message: Union[Message, List[Message], str, bytes, List[str]],
         at_sender: bool = False,
-        extra_metadata: Optional[Dict[str, Any]] = None,
+        extra_metadata: Optional[Mapping[str, object]] = None,
         wait_recall: bool = False,
     ) -> Optional[List[str]]:
         return await self.bot.target_send(

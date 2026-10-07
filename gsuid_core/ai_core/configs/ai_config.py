@@ -872,14 +872,14 @@ LOCAL_EMBEDDING_CONFIG: Dict[str, GSC] = {
         "本地嵌入ONNX线程数",
         "本地嵌入 ONNX intra-op 线程数。越大 CPU 占用与内存 arena 峰值越高。默认 1 面向 2C2G 小机"
         "(2 核上只吃一个核、把另一核留给事件循环避免 Bot 卡顿), 不再随核数(旧默认 cpu//2)放大; "
-        "大机可上调换吞吐。环境变量 GSUID_EMBED_THREADS 优先级更高。改动需重启 core 生效。",
+        "大机可上调换吞吐。只读本配置，不读环境变量。改动需重启 core 生效。",
         1,
         options=[1, 2, 4, 6, 8],
     ),
     "embed_batch_size": GsIntConfig(
         "本地嵌入batch_size",
         "本地嵌入单次推断 batch_size。越大吞吐略高但 onnxruntime 内存峰值越高(fastembed 默认 256 驻留~500MB, "
-        "16~32 更省, 默认 16 面向 2C2G)。环境变量 GSUID_EMBED_BATCH 优先级更高。改动需重启 core 生效。",
+        "16~32 更省, 默认 16 面向 2C2G)。只读本配置，不读环境变量。改动需重启 core 生效。",
         16,
         options=[16, 32, 64, 128, 256],
     ),
@@ -1229,24 +1229,6 @@ MEMORY_CONFIG: Dict[str, GSC] = {
         "记忆评测模式",
         "指定是否启用记忆评测模式, 启用后无法使用 System-2 和 Rerank",
         False,
-    ),
-    "eo_strategy": GsStrConfig(
-        "长时序注入策略",
-        "legacy=注入若干首次提及；ledger=注入压缩全量时间线。环境变量 GSUID_EO_STRATEGY 可覆盖",
-        "legacy",
-        options=["legacy", "ledger"],
-    ),
-    "eo_selector": GsStrConfig(
-        "长时序选择器",
-        "仅 ledger 生效。persona=主人格自选；dedicated=另开一次选择模型。GSUID_EO_SELECTOR 可覆盖",
-        "persona",
-        options=["persona", "dedicated"],
-    ),
-    "ledger_max_chars": GsIntConfig(
-        "时间线总预算",
-        "ledger 策略下排序/摘要题时间线最大字符数。GSUID_LEDGER_MAX_CHARS 可覆盖",
-        28000,
-        options=[8000, 16000, 28000, 40000, 48000],
     ),
 }
 
